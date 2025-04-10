@@ -19,21 +19,29 @@
 #define ENC_B 21
 
 volatile int counter = 0;
+bool blockEncoder = false;
 
 bool buttonState = false;
 bool lastButtonState = false;
 
 std::vector<String> fileList;
 std::vector<String> prevDirs;
-String currentRoot = "";
+String currentRoot = "/";
 String baseRoot = "/";
+
+std::vector<String> fileLines;
+int currentPage = 0;
+const int linesPerPage = 18;
+String openedFileName = "";
+std::vector<uint32_t> pageOffsets;
+
+bool file_is_opened = false;
 
 int fileCount = 0;
 int dirCount = 0;
 int currentPos = 0;
-File root;
 
-bool file_is_opened = false;
+
 
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 
@@ -70,10 +78,9 @@ void setup() {
     return;
   }
   Serial.println("SD Card initialized.");
-  root = SD.open(baseRoot);
+
+  File root = SD.open(baseRoot);
   listFiles(root);
-
-
   printFilesTFT();
 }
 
@@ -83,31 +90,54 @@ void loop() {
   if (buttonState == HIGH && lastButtonState == LOW) {
     if (!file_is_opened) {
       if (currentPos < dirCount) {
-        Serial.print("Trying to open folder: ");
-        Serial.println(fileList[currentPos]);
-        currentRoot = currentRoot + "/" + fileList[currentPos];
-        listFiles(SD.open(currentRoot));
-        counter = 0;
-        if (currentPos == 0)
+        String selected = fileList[currentPos];
+
+        if (selected == "..") {
+          // Назад
+          if (!prevDirs.empty()) {
+            currentRoot = prevDirs.back();
+            prevDirs.pop_back();
+          } else {
+            currentRoot = baseRoot;
+          }
+          listFiles(SD.open(currentRoot));
+          counter = 0;
           printFilesTFT();
+        } else {
+          // Вглиб
+          prevDirs.push_back(currentRoot);
+          if (currentRoot == baseRoot)
+            currentRoot = currentRoot + selected;
+          else
+            currentRoot = currentRoot + "/" + selected;
+          listFiles(SD.open(currentRoot));
+          counter = 0;
+          printFilesTFT();
+        }
       } else {
+        // Відкрити файл
         file_is_opened = true;
-        Serial.print("Trying to open file: ");
-        Serial.println(fileList[currentPos]);
-        displayFileContent(currentRoot + "/" + fileList[currentPos]);
+        blockEncoder = true;
+        if (currentRoot == baseRoot)
+          displayFileContent(currentRoot + fileList[currentPos]);
+        else
+          displayFileContent(currentRoot + "/" + fileList[currentPos]);
       }
     } else if (file_is_opened) {
       file_is_opened = false;
+      blockEncoder = false;
       printFilesTFT();
     }
   }
+
   lastButtonState = buttonState;
 
   // If count has changed print the new value to serial
   if (counter != currentPos) {
     Serial.println(counter);
     currentPos = counter;
-    printFilesTFT();
+    if (!file_is_opened)
+      printFilesTFT();
   }
 }
 
@@ -155,38 +185,38 @@ void printFilesTFT() {
 }
 
 void listFiles(File folder) {
-  fileList.clear();  // Clear previous entries
+  fileList.clear();
   fileCount = 0;
   dirCount = 0;
 
-  tft.fillScreen(ST77XX_BLACK);
-  tft.setCursor(0, 3);
+  if (currentRoot != baseRoot) {
+    fileList.push_back("..");  // Пункт для повернення назад
+    dirCount++;
+  }
+
   while (true) {
     File entry = folder.openNextFile();
     if (!entry) break;
 
     String fileName = entry.name();
 
-    // Skip "System Volume Information"
     if (fileName.equals("System Volume Information")) {
       entry.close();
       continue;
     }
 
     if (entry.isDirectory()) {
-      fileList.insert(fileList.begin(), fileName);
+      fileList.insert(fileList.begin() + dirCount, fileName);
       dirCount++;
     } else {
-      fileList.push_back(fileName);  // Store valid files
+      fileList.push_back(fileName);
       fileCount++;
     }
+
     entry.close();
   }
 
-  Serial.print("File count: ");
-  Serial.println(fileCount);
-  Serial.print("Dir count: ");
-  Serial.println(dirCount);
+  folder.close();
 }
 
 void printDirectory(File dir, int numTabs) {
@@ -216,29 +246,39 @@ void printDirectory(File dir, int numTabs) {
 }
 
 void read_encoder() {
-  // Encoder interrupt routine for both pins. Updates counter
-  // if they are valid and have rotated a full indent
+  static uint8_t old_AB = 3;
+  static int8_t encval = 0;
+  static const int8_t enc_states[] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };
 
-  static uint8_t old_AB = 3;                                                                  // Lookup table index
-  static int8_t encval = 0;                                                                   // Encoder value
-  static const int8_t enc_states[] = { 0, -1, 1, 0, 1, 0, 0, -1, -1, 0, 0, 1, 0, 1, -1, 0 };  // Lookup table
+  old_AB <<= 2;
 
-  old_AB <<= 2;  // Remember previous state
-
-  if (digitalRead(ENC_A)) old_AB |= 0x02;  // Add current state of pin A
-  if (digitalRead(ENC_B)) old_AB |= 0x01;  // Add current state of pin B
+  if (digitalRead(ENC_A)) old_AB |= 0x02;
+  if (digitalRead(ENC_B)) old_AB |= 0x01;
 
   encval += enc_states[(old_AB & 0x0f)];
 
-  // Update counter if encoder has rotated a full indent, that is at least 4 steps
-  if (!file_is_opened && !buttonState) {
+  if (file_is_opened) {
+    if (encval > 3) {
+      if (currentPage + 1 < pageOffsets.size()) {
+        currentPage++;
+        printFilePage(); 
+      }
+      encval = 0;
+    } else if (encval < -3) {
+      if (currentPage > 0) {
+        currentPage--;
+        printFilePage();
+      }
+      encval = 0;
+    }
+  } else if (!buttonState && !blockEncoder) {
     if (encval > 3) {
       if (counter + 1 < fileCount + dirCount)
         counter = counter + 1;
       encval = 0;
     } else if (encval < -3) {
       if (counter - 1 >= 0)
-        counter = counter - 1;  // Update counter
+        counter = counter - 1;
       encval = 0;
     }
   }
@@ -255,26 +295,76 @@ void displayFileContent(const String &fileName) {
     return;
   }
 
-  tft.fillScreen(ST77XX_BLACK);  // Очищаємо екран перед виведенням
-  tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(5, 5);
+  openedFileName = fileName;
+  currentPage = 0;
+  pageOffsets.clear();
+  pageOffsets.push_back(0);  // Перша сторінка починається з 0
 
-  char buffer[21];  // Буфер для читання файлу частинами
-  int y = 0;        // Початкова координата Y для тексту
+  const int maxLineLength = 21;
+  int lineCounter = 0;
 
   while (file.available()) {
-    int bytesRead = file.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
-    buffer[bytesRead] = '\0';  // Завершуємо рядок '\0'
+    uint32_t pos = file.position();
 
-    tft.setCursor(0, y);
-    tft.println(buffer);
-    y += 10;  // Зсуваємо вниз
+    String line = file.readStringUntil('\n');
 
-    // Якщо досягли нижнього краю екрану – очікуємо підтвердження
-    if (y >= 160) {
-      break;
+    // Скільки рядків буде після переносу?
+    int parts = (line.length() + maxLineLength - 1) / maxLineLength;
+
+    lineCounter += parts;
+
+    // Якщо заповнено сторінку — запам’ятай позицію початку наступної
+    if (lineCounter >= linesPerPage) {
+      pageOffsets.push_back(file.position());
+      lineCounter = 0;
     }
   }
+
+  file.close();
+
+  printFilePage();
+}
+
+void printFilePage() {
+  File file = SD.open(openedFileName);
+  if (!file) {
+    Serial.println("Can't reopen file");
+    return;
+  }
+
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setCursor(0, 3);
   tft.setTextColor(ST77XX_WHITE);
+
+  const int maxLineLength = 21;
+  int linesPrinted = 0;
+
+  // Перейти до початку потрібної сторінки
+  if (currentPage < pageOffsets.size()) {
+    file.seek(pageOffsets[currentPage]);
+  } else {
+    file.close();
+    return;
+  }
+
+  while (file.available() && linesPrinted < linesPerPage) {
+    String line = file.readStringUntil('\n');
+    for (int i = 0; i < line.length(); i += maxLineLength) {
+      if (linesPrinted >= linesPerPage) break;
+
+      String part = line.substring(i, i + maxLineLength);
+      tft.println(part);
+      linesPrinted++;
+    }
+  }
+
+  // Показати номер сторінки
+  tft.setTextColor(ST77XX_GREEN);
+  tft.setCursor(0, 160);
+  tft.print("Page ");
+  tft.print(currentPage + 1);
+  tft.print("/");
+  tft.print(pageOffsets.size());
+
   file.close();
 }
